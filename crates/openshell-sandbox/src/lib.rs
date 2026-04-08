@@ -1755,13 +1755,17 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
                     path.display()
                 ));
             }
+            // Directory already exists in the image — respect the image
+            // author's ownership.  They may have set root:root intentionally
+            // to protect immutable subdirectories via DAC while keeping the
+            // path in read_write for Landlock.
+            debug!(path = %path.display(), "read_write directory exists — preserving image ownership");
         } else {
             debug!(path = %path.display(), "Creating read_write directory");
             std::fs::create_dir_all(path).into_diagnostic()?;
+            debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on new read_write directory");
+            chown(path, uid, gid).into_diagnostic()?;
         }
-
-        debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
-        chown(path, uid, gid).into_diagnostic()?;
     }
 
     Ok(())
