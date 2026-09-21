@@ -111,6 +111,12 @@ const EVENT_QUEUE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
 /// while the consumer remains behind.
 const OVERLOAD_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Grace period, after the first sandbox activity is observed, before the
+/// zero-events watchdog warns that the session has matched no provider
+/// events at all. Generous on purpose: the goal is to catch a genuinely
+/// non-firing provider, not to flag normal per-sandbox event latency.
+const ZERO_EVENTS_GRACE: Duration = Duration::from_secs(30);
+
 /// `EVENT_CONTROL_CODE_ENABLE_PROVIDER`.
 const EVENT_CONTROL_CODE_ENABLE_PROVIDER: u32 = 1;
 
@@ -291,6 +297,14 @@ struct CaptureHealth {
     queued_bytes: AtomicUsize,
     /// Largest observed value of `queued_bytes`, retained for diagnostics.
     queue_high_water_bytes: AtomicUsize,
+    /// Count of raw events the callback matched to [`SANDBOXING_PROVIDER_GUID`]
+    /// and forwarded to the consumer thread, regardless of whether TDH decode
+    /// later succeeded. Zero here after real sandbox activity means the OS
+    /// session is not delivering *any* events under this GUID at all -- a
+    /// provider-identity mismatch or a provider that isn't firing on this
+    /// host/build, not a decode/attribution bug. See the zero-events watchdog
+    /// in `start_session`'s consumer loop.
+    events_matched: AtomicU64,
 }
 
 struct CallbackContext {
@@ -380,6 +394,13 @@ impl EtwSession {
     pub fn dropped_event_count(&self) -> u64 {
         self.health.dropped_events.load(Ordering::Relaxed)
     }
+
+    /// Count of raw provider-matched events received since the session
+    /// started. Exposed so the backend can surface "capture is running but
+    /// producing nothing" in status/diagnostics, alongside `is_capture_alive`.
+    pub fn events_received(&self) -> u64 {
+        self.health.events_matched.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for EtwSession {
@@ -420,10 +441,12 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
     let handle = start_trace_session(&session_name)?;
     enable_provider(handle, &session_name)?;
 
+    // Created before the consumer thread spawns (unlike the pump thread's
+    // `health` clone below) so the consumer loop can track received-event
+    // count for the zero-events watchdog.
     let health = Arc::new(CaptureHealth::default());
     let consumer_health = health.clone();
     let (tx, rx) = mpsc::sync_channel::<RawEtwEvent>(EVENT_QUEUE_CAPACITY);
-
     let consumer_thread = std::thread::Builder::new()
         .name("etw-ocsf-consumer".into())
         .spawn(move || {
@@ -435,10 +458,23 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
             // lull: an event that beat the driver's `register_launch` is replayed
             // within one tick once attribution lands, without having to wait for
             // the next ETW event (which may never arrive for a lone/last sandbox).
+            //
+            // Zero-events watchdog: `EnableTraceEx2` success is not proof the
+            // provider exists or will ever fire (see `SANDBOXING_PROVIDER_GUID`'s
+            // doc comment). If real sandbox activity has happened and this
+            // session still hasn't matched a single event after a grace period,
+            // that is a provider-identity mismatch or a non-firing provider on
+            // this host/build -- warn once instead of silently producing an
+            // empty audit trail.
+            let mut activity_since: Option<Instant> = None;
+            let mut warned_no_events = false;
             loop {
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(mut raw) => {
                         release_queue_bytes(&consumer_health, raw.queued_bytes);
+                        consumer_health
+                            .events_matched
+                            .fetch_add(1, Ordering::Relaxed);
                         if let Some(ev) = decode_raw(&mut raw) {
                             process_event(&index, ev);
                         } else {
@@ -461,6 +497,18 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                         overload_reporter.report_if_due(&consumer_health, true);
                         break;
                     }
+                }
+
+                if !warned_no_events
+                    && should_warn_zero_events(
+                        consumer_health.events_matched.load(Ordering::Relaxed),
+                        index.lock().unwrap().total_launches(),
+                        &mut activity_since,
+                        ZERO_EVENTS_GRACE,
+                    )
+                {
+                    warned_no_events = true;
+                    warn_zero_events_received();
                 }
             }
             // Final drain on shutdown so anything still resolvable is emitted.
@@ -1268,6 +1316,15 @@ pub(crate) struct AttributionIndex {
     by_identity: HashMap<String, String>,
     by_activity: HashMap<String, String>,
     by_cv: HashMap<String, String>,
+    /// Launches registered via [`Self::register_launch`] that haven't yet been
+    /// bound to an `identity`/CV. Unlike the PID, `wxc-exec` never reports its
+    /// OS-generated `identity`/`__TlgCV__` back to the driver ahead of time, so
+    /// there's nothing to pre-seed `by_identity` with at registration. This
+    /// queue lets [`Self::resolve`] bind the first identity/CV-bearing event
+    /// to the sole pending launch when exactly one is outstanding -- the only
+    /// case where "which launch produced this event" isn't ambiguous. Entries
+    /// older than [`PENDING_TTL`] are dropped unclaimed.
+    pending_launches: VecDeque<(String, Instant)>,
     /// Sandboxes whose driver-owned `wxc-exec` process has exited. Their strong
     /// correlations remain authoritative only until the recorded instant plus
     /// [`RETIRED_CORRELATION_TTL`].
@@ -1282,6 +1339,11 @@ pub(crate) struct AttributionIndex {
     /// them here and replay when a later registration/cross-link resolves them.
     /// Bounded by [`PENDING_MAX`] and [`PENDING_TTL`].
     pending: VecDeque<PendingEvent>,
+    /// Total sandboxes ever registered, never decremented by [`Self::forget`].
+    /// Used to gate the zero-events watchdog: a session that hasn't seen any
+    /// sandbox activity yet is expected to be quiet, so only warn once real
+    /// activity has happened and still produced nothing.
+    total_launches: u64,
 }
 
 impl AttributionIndex {
@@ -1300,6 +1362,7 @@ impl AttributionIndex {
         wxc_pid: u32,
         process_start_key: u64,
     ) {
+        self.total_launches += 1;
         let now = Instant::now();
         self.purge_expired_retirements(now);
         let previous = self.by_pid.remove(&wxc_pid);
@@ -1338,6 +1401,8 @@ impl AttributionIndex {
 
         self.names
             .insert(sandbox_id.to_string(), sandbox_name.to_string());
+        self.pending_launches
+            .push_back((sandbox_id.to_string(), now));
     }
 
     /// Retire a driver-owned PID after its monitored child exits. The exact
@@ -1371,6 +1436,12 @@ impl AttributionIndex {
             .any(|registration| registration.sid == sandbox_id)
     }
 
+    /// Total sandboxes ever registered via [`Self::register_launch`], including
+    /// ones since [`Self::forget`]-ten. Used to gate the zero-events watchdog.
+    pub fn total_launches(&self) -> u64 {
+        self.total_launches
+    }
+
     /// Drop all keys for a finished sandbox to bound memory.
     pub fn forget(&mut self, sandbox_id: &str) {
         self.by_pid
@@ -1379,8 +1450,24 @@ impl AttributionIndex {
         self.by_activity.retain(|_, v| v != sandbox_id);
         self.by_cv.retain(|_, v| v != sandbox_id);
         self.retired_sandboxes.remove(sandbox_id);
+        self.pending_launches.retain(|(sid, _)| sid != sandbox_id);
         self.names.remove(sandbox_id);
         self.lifecycle_emitted.remove(sandbox_id);
+    }
+
+    /// Drop launches that never got a first identity/CV within [`PENDING_TTL`]
+    /// of [`Self::register_launch`] (e.g. the Sandboxing provider never fired
+    /// for them, or their events aged out of the unresolved-event buffer
+    /// first). Keeps the queue from growing unbounded and stops a long-dead
+    /// launch from later soaking up an unrelated event.
+    fn purge_expired_pending_launches(&mut self, now: Instant) {
+        while let Some(&(_, at)) = self.pending_launches.front() {
+            if now.duration_since(at) > PENDING_TTL {
+                self.pending_launches.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     fn purge_expired_retirements(&mut self, now: Instant) {
@@ -1428,7 +1515,8 @@ impl AttributionIndex {
     /// accepted only when ETW's process start key equals the key queried from
     /// the live driver-owned child handle.
     fn resolve(&mut self, ev: &DecodedEtwEvent) -> Option<String> {
-        self.purge_expired_retirements(Instant::now());
+        let now = Instant::now();
+        self.purge_expired_retirements(now);
         let identity = ev.identity();
         let cv = ev.cv_base();
         let activity = guid_key(&ev.activity_id);
@@ -1446,8 +1534,53 @@ impl AttributionIndex {
                 self.by_pid.get(&ev.process_id).and_then(|r| {
                     (ev.process_start_key == Some(r.process_start_key)).then(|| r.sid.clone())
                 })
+            })
+            .or_else(|| {
+                // `wxc-exec` never reports its OS-generated `identity`/CV back
+                // to the driver, so nothing pre-seeds `by_identity` the way
+                // `by_pid` is pre-seeded at `register_launch`. Bind
+                // opportunistically instead: if this event carries a key we've
+                // never seen *and* exactly one launch is still waiting for its
+                // first event, it can only be that launch's burst -- claim it.
+                // With zero or >=2 pending launches the match is ambiguous (no
+                // launch to claim it, or which one fired this event?), so
+                // refuse to guess and fall through to the unresolved-event
+                // buffer instead; misattributing an audit event to the wrong
+                // sandbox_id is worse than dropping it. This can still
+                // misattribute on a host where unrelated, non-OpenShell
+                // AppContainer/UAC activity shares this same OS Sandboxing
+                // provider while exactly one OpenShell launch happens to be
+                // pending -- eliminating that requires wxc-exec/the relay to
+                // report `identity`/CV back to the driver directly instead of
+                // being inferred here.
+                //
+                // Only applies when this event's PID has no `by_pid` entry at
+                // all (the real-world case: the shared OS broker PID that
+                // fires most Sandboxing events is never registered there in
+                // the first place). If a registration *does* exist for this
+                // PID -- even a generation-mismatched or since-displaced one
+                // -- that's positive evidence this event belongs to a PID
+                // race the generation-key check already deliberately refused,
+                // and guessing via pending-launch count must not override
+                // that refusal.
+                if self.by_pid.contains_key(&ev.process_id) {
+                    return None;
+                }
+                if identity.is_none() && cv.is_none() {
+                    return None;
+                }
+                self.purge_expired_pending_launches(now);
+                if self.pending_launches.len() != 1 {
+                    return None;
+                }
+                self.pending_launches.pop_front().map(|(sid, _)| sid)
             })?;
 
+        // Whichever path resolved this event, the launch no longer needs the
+        // opportunistic identity binding above -- drop its pending-launch
+        // entry so it can't inflate a later "exactly one pending" count.
+        self.pending_launches
+            .retain(|(pending_sid, _)| pending_sid != &sid);
         self.cross_link(&sid, identity, cv, activity);
         Some(sid)
     }
@@ -1480,7 +1613,11 @@ impl AttributionIndex {
             if now.duration_since(front.at) > PENDING_TTL {
                 let stale = self.pending.pop_front();
                 if let Some(p) = stale {
-                    tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
+                    // A permanently dropped event is an audit-trail gap (the
+                    // OS action it represents will never appear in the OCSF
+                    // log), so it's worth surfacing above debug level by
+                    // default rather than only under `--log-level debug`.
+                    tracing::warn!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
                 }
             } else {
                 break;
@@ -1489,7 +1626,7 @@ impl AttributionIndex {
         if self.pending.len() >= PENDING_MAX
             && let Some(p) = self.pending.pop_front()
         {
-            tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
+            tracing::warn!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
         }
         self.pending.push_back(PendingEvent { at: now, ev });
     }
@@ -1509,7 +1646,7 @@ impl AttributionIndex {
         let mut keep = VecDeque::with_capacity(drained.len());
         for p in drained {
             if now.duration_since(p.at) > PENDING_TTL {
-                tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
+                tracing::warn!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
                 continue;
             }
             match self.resolve(&p.ev) {
@@ -1826,6 +1963,74 @@ fn map_finding(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
         )
         .message(format!("MXC reported {kind} during sandbox setup"))
         .build()
+}
+
+/// Decide whether the zero-events watchdog should fire, and track when
+/// sandbox activity was first observed. Pure aside from `*activity_since`,
+/// which the caller retains across calls (and across a loop tick that
+/// doesn't warn) so the grace period is measured from first activity, not
+/// re-armed on every tick.
+///
+/// Gates on `total_launches` (not the index's current size) specifically so
+/// a quiet, idle gateway with `etw_audit=true` but zero sandboxes created
+/// never warns -- only genuine "activity happened, nothing arrived" does.
+fn should_warn_zero_events(
+    events_matched: u64,
+    total_launches: u64,
+    activity_since: &mut Option<Instant>,
+    grace: Duration,
+) -> bool {
+    if events_matched != 0 {
+        return false;
+    }
+    if activity_since.is_none() && total_launches > 0 {
+        *activity_since = Some(Instant::now());
+    }
+    activity_since.is_some_and(|since| since.elapsed() >= grace)
+}
+
+/// Fired once per session by the zero-events watchdog when real sandbox
+/// activity has happened but the session has never matched a single event to
+/// [`SANDBOXING_PROVIDER_GUID`]. `EnableTraceEx2` success only proves the
+/// *request* to enable the provider succeeded, not that the provider exists
+/// on this host/build or will ever actually fire -- this is the detection gap
+/// that made a real-world provider-identity mismatch silently produce an
+/// empty OCSF audit trail with no diagnostic at all.
+fn warn_zero_events_received() {
+    tracing::warn!(
+        target: "mxc_etw",
+        provider = ?SANDBOXING_PROVIDER_GUID,
+        session = SESSION_NAME_PREFIX,
+        "MXC ETW->OCSF consumer has received zero events from the Sandboxing \
+         provider despite sandbox activity; the OS-sourced audit trail is \
+         empty for this session. EnableTraceEx2 succeeding does not prove the \
+         provider exists on this host/build or will ever fire -- verify with \
+         `logman query providers` and confirm wxc-exec targets this GUID."
+    );
+    emit_ocsf(
+        "",
+        DetectionFindingBuilder::new(&etw_ctx("", "mxc-etw-consumer"))
+            .activity(ActivityId::Open) // finding label = "Create"
+            .severity(SeverityId::High)
+            .is_alert(true)
+            .finding_info(
+                FindingInfo::new(
+                    "mxc-etw-zero-events",
+                    "MXC ETW audit consumer received zero provider events",
+                )
+                .with_desc(
+                    "The Sandboxing ETW provider produced zero events despite \
+                     observed sandbox activity; the OS-sourced portion of the \
+                     audit trail is empty for this session.",
+                ),
+            )
+            .message(
+                "MXC ETW->OCSF consumer active but received zero events from \
+                 the Sandboxing provider after sandbox activity"
+                    .to_string(),
+            )
+            .build(),
+    );
 }
 
 /// Best-effort executable name from a command line: first whitespace-delimited
@@ -2198,6 +2403,74 @@ mod tests {
         assert_eq!(idx.resolve(&ev_b).as_deref(), Some("sbx-B"));
     }
 
+    // Regression test for the zero-events watchdog: it must gate on whether
+    // sandbox activity has *ever* happened, not on the index's current size,
+    // since `forget` empties the index for every sandbox that completes
+    // normally -- `total_launches` must keep counting past that.
+    #[test]
+    fn total_launches_survives_forget() {
+        let mut idx = AttributionIndex::new();
+        assert_eq!(idx.total_launches(), 0);
+
+        idx.register_launch("sbx-1", "s1", 100, 1);
+        idx.forget("sbx-1");
+        assert_eq!(idx.total_launches(), 1);
+
+        idx.register_launch("sbx-2", "s2", 200, 2);
+        idx.register_launch("sbx-3", "s3", 300, 3);
+        assert_eq!(idx.total_launches(), 3);
+    }
+
+    #[test]
+    fn zero_events_watchdog_stays_quiet_without_sandbox_activity() {
+        // An idle gateway with etw_audit=true but no sandboxes created yet
+        // must never warn, however long it's been running.
+        let mut activity_since = None;
+        assert!(!should_warn_zero_events(
+            0,
+            0,
+            &mut activity_since,
+            Duration::ZERO
+        ));
+        assert!(activity_since.is_none());
+    }
+
+    #[test]
+    fn zero_events_watchdog_stays_quiet_once_any_event_matched() {
+        let mut activity_since = None;
+        assert!(!should_warn_zero_events(
+            1,
+            5,
+            &mut activity_since,
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn zero_events_watchdog_waits_out_the_grace_period() {
+        let mut activity_since = None;
+        let grace = Duration::from_hours(1);
+        // First tick after activity starts: grace hasn't elapsed yet.
+        assert!(!should_warn_zero_events(0, 1, &mut activity_since, grace));
+        assert!(activity_since.is_some());
+        // A later tick still within the (long) grace window: still quiet.
+        assert!(!should_warn_zero_events(0, 1, &mut activity_since, grace));
+    }
+
+    #[test]
+    fn zero_events_watchdog_fires_once_grace_elapses() {
+        let mut activity_since = Some(Instant::now().checked_sub(Duration::from_mins(1)).unwrap());
+        assert!(should_warn_zero_events(
+            0,
+            1,
+            &mut activity_since,
+            Duration::from_secs(30)
+        ));
+    }
+
+    // Shailendra #1 (cmd ambiguity): two sandboxes running the identical command
+    // line must not let that command line resolve anything (it's ambiguous); a
+    // unique command line still works as a fallback.
     #[test]
     fn displaced_live_pid_does_not_claim_new_pre_registration_event() {
         let mut idx = AttributionIndex::new();
@@ -2396,5 +2669,108 @@ mod tests {
             .push(("commandLine".into(), "\"agent --unique\"".into()));
 
         assert!(idx.resolve(&only_cmd).is_none());
+    }
+
+    // wxc-exec never reports its OS-generated `identity`/CV back to the
+    // driver ahead of time, so events fired under a shared, non-driver-owned
+    // PID (e.g. the broker service hosting the OS Sandboxing provider) can
+    // only resolve opportunistically: exactly one still-pending launch and an
+    // identity/CV never seen before.
+    #[test]
+    fn single_pending_launch_binds_via_identity_when_event_pid_is_unregistered() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+
+        // Event fired under a PID the driver never registered (e.g. the
+        // shared broker service), carrying an identity never seen before.
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert_eq!(
+            idx.resolve(&ev).as_deref(),
+            Some("sbx-1"),
+            "the sole pending launch is the only possible source of a fresh identity"
+        );
+
+        // The identity is now cross-linked, so a later keyless-PID event
+        // carrying the same identity resolves without consulting the
+        // pending-launch queue (which is now empty for this sandbox).
+        let mut same_identity = mk_event(6980, "EnforceOsPolicy");
+        same_identity.process_start_key = None;
+        same_identity
+            .props
+            .push(("identity".into(), "sandbox-abc123".into()));
+        assert_eq!(idx.resolve(&same_identity).as_deref(), Some("sbx-1"));
+    }
+
+    #[test]
+    fn ambiguous_pending_launches_refuse_to_guess_via_identity() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+        idx.register_launch("sbx-2", "s2", 2000, 2000);
+
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert!(
+            idx.resolve(&ev).is_none(),
+            "two candidate launches make the event's true owner ambiguous"
+        );
+    }
+
+    #[test]
+    fn pending_launch_does_not_bind_when_a_pid_registration_exists_for_the_event() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+
+        // The event's PID (1000) does have a `by_pid` registration, just a
+        // generation-mismatched one -- that is positive evidence pointing at
+        // a PID-reuse race the generation-key check deliberately refused, not
+        // "no evidence at all". The opportunistic identity fallback must not
+        // override that refusal even though exactly one launch is pending.
+        let mut ev = mk_event(1000, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = Some(9999);
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert!(idx.resolve(&ev).is_none());
+    }
+
+    #[test]
+    fn resolved_launch_no_longer_counts_toward_pending_ambiguity() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+        idx.register_launch("sbx-2", "s2", 2000, 2000);
+
+        // sbx-1 resolves normally via its own registered PID, which must
+        // clear its pending-launch entry.
+        let seed = mk_event(1000, "CreateProcessInSandbox");
+        assert_eq!(idx.resolve(&seed).as_deref(), Some("sbx-1"));
+
+        // Only sbx-2 is still pending now, so a broker-PID event with a fresh
+        // identity is unambiguous and binds to it.
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-xyz789".into()));
+        assert_eq!(idx.resolve(&ev).as_deref(), Some("sbx-2"));
+    }
+
+    #[test]
+    fn stale_pending_launch_expires_and_stops_claiming_events() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+        idx.pending_launches.back_mut().expect("pending launch").1 = Instant::now()
+            .checked_sub(PENDING_TTL + Duration::from_millis(1))
+            .expect("test duration is shorter than the monotonic clock epoch");
+
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert!(
+            idx.resolve(&ev).is_none(),
+            "a launch that never got a first event within PENDING_TTL must not be claimable later"
+        );
     }
 }
