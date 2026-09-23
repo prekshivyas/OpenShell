@@ -4060,7 +4060,6 @@ dependencies = [
  "tonic-types",
  "tracing",
  "url",
- "windows",
 ]
 
 [[package]]

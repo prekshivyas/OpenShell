@@ -2323,13 +2323,13 @@ async fn validate_provider_composition_for_existing_sandboxes(
     }
 }
 
-fn require_live_policy_update_support(state: &ServerState) -> Result<(), Status> {
+pub(super) fn require_live_policy_update_support(state: &ServerState) -> Result<(), Status> {
     if state.compute.supports_live_policy_updates() {
         return Ok(());
     }
 
     Err(Status::failed_precondition(format!(
-        "compute driver '{}' cannot apply policy updates to an existing sandbox; delete and recreate the sandbox with the requested policy",
+        "compute driver '{}' cannot apply effective policy changes to an existing sandbox; delete and recreate the sandbox with the requested policy",
         state.compute.configured_driver_name()
     )))
 }
@@ -8653,6 +8653,37 @@ mod tests {
                 .expect("global policy remains configured"),
             initial
         );
+    }
+
+    #[tokio::test]
+    async fn global_policy_transition_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        let guard = state.compute.sandbox_sync_guard().await;
+
+        let update_state = state.clone();
+        let update = tokio::spawn(async move {
+            handle_update_config(
+                &update_state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(test_policy_with_rule("global", "global.example.com")),
+                    ..Default::default()
+                })),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !update.is_finished(),
+            "global update should wait for the guard"
+        );
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), update)
+            .await
+            .expect("global update should finish after guard release")
+            .expect("join global update")
+            .expect("global update should succeed");
     }
 
     #[tokio::test]
